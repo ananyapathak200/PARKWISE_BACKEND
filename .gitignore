@@ -1,9 +1,19 @@
+# secrets
 .env
 .env.*
 !.env.example
 
+# user uploads and local databases never go to GitHub
+uploads/
+*.db
+*.sqlite3
+
+# Python
 __pycache__/
 *.py[cod]
 venv/
 .venv/
 node_modules/
+
+# local backups
+_backup*/

@@ -9,13 +9,20 @@ import os
 # Use SQLite for this test run only, so it works without a real
 # PostgreSQL server. Production still uses the .env DATABASE_URL.
 os.environ["DATABASE_URL"] = "sqlite:///./test_parkwise.db"
-os.environ["JWT_SECRET_KEY"] = "test-secret"
+os.environ["JWT_SECRET_KEY"] = "test-only-secret-that-is-long-enough-1234567890"
+os.environ.setdefault("RAZORPAY_KEY_ID", "rzp_test_dummy")
+os.environ.setdefault("RAZORPAY_KEY_SECRET", "dummy_secret")
 
 if os.path.exists("test_parkwise.db"):
     os.remove("test_parkwise.db")
 
+from datetime import datetime, timedelta
 from fastapi.testclient import TestClient
 from main import app
+import routers.bookings as bookings_router
+
+# Don't call the real Razorpay API in a test: pretend an order was created.
+bookings_router.create_order = lambda amount_rupees, receipt: {"id": "order_test_123"}
 
 client = TestClient(app)
 
@@ -43,12 +50,22 @@ owner = client.post("/auth/signup", json={
 }).json()
 owner_token = owner["access_token"]
 
-admin = client.post("/auth/signup", json={
-    "name": "Admin User", "email": "admin@example.com", "phone": "9876500003",
+# Admins can't sign up through the API any more — create one directly, like create_admin.py does.
+import auth as auth_utils
+from database import SessionLocal
+import models
+_db = SessionLocal()
+_db.add(models.User(name="Admin User", email="admin@example.com", phone="9876500003",
+                    password_hash=auth_utils.hash_password("password123"), role="admin"))
+_db.commit()
+_db.close()
+admin_signup = client.post("/auth/signup", json={
+    "name": "Admin User", "email": "evil@example.com", "phone": "9876500004",
     "password": "password123", "role": "admin"
-}).json()
-admin_token = admin["access_token"]
-check("owner and admin signup work", "access_token" in owner and "access_token" in admin)
+})
+check("signing up as admin is refused", admin_signup.status_code == 422)
+admin_token = client.post("/auth/login", json={"email": "admin@example.com", "password": "password123"}).json()["access_token"]
+check("owner signup and admin login work", "access_token" in owner and admin_token)
 
 print("\n--- login ---")
 login_r = client.post("/auth/login", json={"email": "priya@example.com", "password": "password123"})
@@ -71,7 +88,7 @@ listing_id = listing["id"]
 
 print("\n--- driver can't create a listing (role check) ---")
 forbidden = client.post("/parking-areas", headers={"Authorization": f"Bearer {driver_token}"}, json={
-    "name": "x", "address": "x", "latitude": 0, "longitude": 0, "price_per_hour": 1, "slots": 1
+    "name": "xx", "address": "xxx", "latitude": 0, "longitude": 0, "price_per_hour": 1, "slots": 1
 })
 check("driver is blocked from creating listings (403)", forbidden.status_code == 403)
 
@@ -92,20 +109,17 @@ check("search returns a real distance_km", match["distance_km"] is not None and 
 check("search returns a suitability score", match["score"] is not None and 0 <= match["score"] <= 100)
 
 print("\n--- driver books a slot ---")
-listing_detail = client.get(f"/parking-areas/{listing_id}").json()
-slot_id = None
 # fetch a real slot id via the DB directly through the app's session for this test
-from database import SessionLocal
-import models
 db = SessionLocal()
 slot = db.query(models.ParkingSlot).filter(models.ParkingSlot.parking_area_id == listing_id).first()
 slot_id = slot.id
 db.close()
 
 driver_headers = {"Authorization": f"Bearer {driver_token}"}
+day = (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
 booking = client.post("/bookings", headers=driver_headers, json={
     "slot_id": slot_id, "vehicle_number": "UP65AB1234",
-    "start_time": "2026-08-25T18:00:00", "end_time": "2026-08-25T20:00:00"
+    "start_time": f"{day}T18:00:00", "end_time": f"{day}T20:00:00"
 }).json()
 check("booking created with status reserved", booking["status"] == "reserved")
 check("booking has a QR token", booking["qr_code_token"].startswith("PW-"))
@@ -114,14 +128,14 @@ booking_id = booking["id"]
 print("\n--- double-booking the same slot/time is rejected ---")
 conflict = client.post("/bookings", headers=driver_headers, json={
     "slot_id": slot_id, "vehicle_number": "UP65XY9999",
-    "start_time": "2026-08-25T18:30:00", "end_time": "2026-08-25T19:30:00"
+    "start_time": f"{day}T18:30:00", "end_time": f"{day}T19:30:00"
 })
 check("overlapping booking rejected with 409", conflict.status_code == 409)
 
 print("\n--- non-overlapping time on same slot succeeds ---")
 non_overlap = client.post("/bookings", headers=driver_headers, json={
     "slot_id": slot_id, "vehicle_number": "UP65AB1234",
-    "start_time": "2026-08-25T21:00:00", "end_time": "2026-08-25T22:00:00"
+    "start_time": f"{day}T21:00:00", "end_time": f"{day}T22:00:00"
 })
 check("non-overlapping booking on same slot succeeds", non_overlap.status_code == 200)
 
@@ -132,7 +146,7 @@ check("check-in succeeds", checkin.status_code == 200 and checkin.json()["status
 print("\n--- check out and bill calculation ---")
 checkout = client.post(f"/bookings/{booking_id}/checkout", headers=driver_headers)
 checkout_data = checkout.json()
-check("check-out succeeds", checkout.status_code == 200 and checkout_data["status"] == "completed")
+check("check-out creates a payment order", checkout.status_code == 200 and checkout_data["razorpay_order_id"] == "order_test_123")
 check("amount was calculated", checkout_data["amount"] is not None and checkout_data["amount"] > 0)
 print(f"     billed amount: Rs.{checkout_data['amount']} (minimum 15-min grace period applied since checkout was instant)")
 
@@ -143,7 +157,7 @@ check("booking history returns bookings", len(history) >= 2)
 print("\n--- admin stats reflect real activity ---")
 stats = client.get("/admin/stats", headers=admin_headers).json()
 check("stats show 1 approved listing", stats["approved"] == 1)
-check("stats show revenue collected", stats["revenue"] > 0)
+check("no revenue until payment is verified", stats["revenue"] == 0)
 print(f"     stats: {stats}")
 
 print("\nALL CHECKS PASSED — the full flow works end to end.\n")

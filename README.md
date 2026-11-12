@@ -86,3 +86,12 @@ Matches the "what to skip" section of the roadmap:
   a frontend concern using any JS QR library)
 - Reviews (`Review` model exists, but no router yet — add
   `routers/reviews.py` following the same pattern as the others)
+
+## Security (Nov 2026)
+
+See `SECURITY.md` for the full check. In short:
+
+- Settings and secrets live in `.env` (copy `.env.example`); `config.py` reads them.
+- Admin accounts are created only with `python create_admin.py`.
+- Run `python test_security.py` and `python test_flow.py` after changes.
+- Run locally: `uvicorn main:app --reload --port 9000`. On the VPS set `ENVIRONMENT=production`.

@@ -1,12 +1,18 @@
 """
 dependencies.py — reusable FastAPI dependencies:
-  get_current_user  -> resolves the logged-in user from the JWT
-  require_role(...)  -> a dependency factory that also enforces role
+  get_current_user   -> resolves the logged-in user from the JWT (401 if missing/invalid)
+  get_optional_user  -> same, but returns None for visitors who aren't logged in
+  require_role(...)  -> also enforces role (403 otherwise)
+
+The role is always read from the DATABASE, never trusted from the token
+or the browser, so changing localStorage can't make anyone an admin.
 """
 
+from typing import Optional
+
+import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -16,29 +22,36 @@ import models
 # tokenUrl is just for the /docs "Authorize" button — the actual login
 # endpoint is POST /auth/login, which returns the token in its response body.
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
+optional_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)
+
+
+def _user_from_token(token: str, db: Session) -> Optional[models.User]:
+    try:
+        payload = decode_access_token(token)
+    except jwt.InvalidTokenError:
+        return None
+    return db.query(models.User).filter(models.User.id == payload.get("sub")).first()
 
 
 def get_current_user(
     token: str = Depends(oauth2_scheme),
     db: Session = Depends(get_db),
 ) -> models.User:
-    credentials_error = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = decode_access_token(token)
-        user_id = payload.get("sub")
-        if user_id is None:
-            raise credentials_error
-    except JWTError:
-        raise credentials_error
-
-    user = db.query(models.User).filter(models.User.id == user_id).first()
+    user = _user_from_token(token, db)
     if user is None:
-        raise credentials_error
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return user
+
+
+def get_optional_user(
+    token: Optional[str] = Depends(optional_oauth2_scheme),
+    db: Session = Depends(get_db),
+) -> Optional[models.User]:
+    return _user_from_token(token, db) if token else None
 
 
 def require_role(*allowed_roles: str):
@@ -52,7 +65,7 @@ def require_role(*allowed_roles: str):
         if user.role not in allowed_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"This action requires one of these roles: {', '.join(allowed_roles)}",
+                detail="You don't have permission to do this.",
             )
         return user
     return dependency

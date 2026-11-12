@@ -4,12 +4,13 @@ routers/reviews.py — matches receipt.js on the frontend:
   GET  /parking-areas/{area_id}/reviews
 """
 
-from typing import List
+from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from database import get_db
-from dependencies import get_current_user
+from dependencies import get_current_user, get_optional_user
+from routers.parking_areas import can_see_listing
 import models
 import schemas
 
@@ -24,10 +25,8 @@ def create_review(
     user: models.User = Depends(get_current_user),
 ):
     booking = db.query(models.Booking).filter(models.Booking.id == booking_id).first()
-    if not booking:
+    if not booking or booking.user_id != user.id:
         raise HTTPException(status_code=404, detail="Booking not found.")
-    if booking.user_id != user.id:
-        raise HTTPException(status_code=403, detail="This isn't your booking.")
     if booking.status != "completed":
         raise HTTPException(status_code=400, detail="You can only review a completed booking.")
 
@@ -38,7 +37,7 @@ def create_review(
     review = models.Review(
         booking_id=booking_id,
         rating=payload.rating,
-        comment=payload.comment,
+        comment=payload.comment or None,
     )
     db.add(review)
     db.commit()
@@ -47,9 +46,13 @@ def create_review(
 
 
 @router.get("/parking-areas/{area_id}/reviews", response_model=List[schemas.ReviewOut])
-def get_reviews_for_listing(area_id: str, db: Session = Depends(get_db)):
+def get_reviews_for_listing(
+    area_id: str,
+    db: Session = Depends(get_db),
+    user: Optional[models.User] = Depends(get_optional_user),
+):
     area = db.query(models.ParkingArea).filter(models.ParkingArea.id == area_id).first()
-    if not area:
+    if not area or not can_see_listing(area, user):
         raise HTTPException(status_code=404, detail="Listing not found.")
 
     reviews = (
@@ -58,6 +61,7 @@ def get_reviews_for_listing(area_id: str, db: Session = Depends(get_db)):
         .join(models.ParkingSlot, models.Booking.slot_id == models.ParkingSlot.id)
         .filter(models.ParkingSlot.parking_area_id == area_id)
         .order_by(models.Review.created_at.desc())
+        .limit(100)
         .all()
     )
     return reviews

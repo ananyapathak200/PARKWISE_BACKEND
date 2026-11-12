@@ -3,7 +3,7 @@ utils/payments.py — all Razorpay interaction lives here, in one place,
 so the security-critical signature verification is easy to review.
 
 SECURITY NOTES (read before touching this file):
-- RAZORPAY_KEY_SECRET must only ever be read from the environment here.
+- RAZORPAY_KEY_SECRET is only ever read from the environment (config.py).
   It must never be sent to the frontend, logged, or hardcoded.
 - verify_payment_signature() is the ONLY thing that should ever mark a
   booking as paid. Never trust a "payment succeeded" message that comes
@@ -13,19 +13,9 @@ SECURITY NOTES (read before touching this file):
   produced, which is why this check is what actually matters.
 """
 
-import os
-import hmac
-import hashlib
 import razorpay
 
-RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
-RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
-
-if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
-    raise RuntimeError(
-        "RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET are not set. "
-        "Copy .env.example to .env and fill in your Razorpay test keys."
-    )
+from config import RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET
 
 _client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
@@ -60,5 +50,5 @@ def verify_payment_signature(razorpay_order_id: str, razorpay_payment_id: str, r
             "razorpay_signature": razorpay_signature,
         })
         return True
-    except razorpay.errors.SignatureVerificationError:
+    except Exception:  # SignatureVerificationError, or malformed input
         return False

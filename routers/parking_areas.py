@@ -11,25 +11,48 @@ dashboard.html, and listing-edit.html on the frontend:
   POST   /parking-areas/{id}/photo
 """
 
+import logging
 import os
 import uuid
 from typing import Optional, List, Literal
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
+from config import UPLOAD_DIR
 from database import get_db
-from dependencies import get_current_user, require_role
+from dependencies import get_current_user, get_optional_user, require_role
 from utils.scoring import haversine_km, compute_score
 import models
 import schemas
 
 router = APIRouter(prefix="/parking-areas", tags=["parking-areas"])
+log = logging.getLogger("parkwise.uploads")
 
-UPLOAD_DIR = "uploads"
-ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+def _image_extension(data: bytes) -> Optional[str]:
+    """
+    Decide the file type from the file's own first bytes, not from the
+    name or Content-Type the browser sends (both are easy to fake). This
+    stops someone uploading a web page or script renamed to .png.
+    """
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def can_see_listing(area: models.ParkingArea, user: Optional[models.User]) -> bool:
+    """Approved listings are public; pending/rejected ones only for their owner and admins."""
+    if area.status == "approved":
+        return True
+    return user is not None and (user.id == area.owner_id or user.role == "admin")
 
 
 def _to_out(area: models.ParkingArea, db: Session, lat: Optional[float] = None, lng: Optional[float] = None) -> schemas.ParkingAreaOut:
@@ -77,6 +100,15 @@ def _to_out(area: models.ParkingArea, db: Session, lat: Optional[float] = None, 
     )
 
 
+def _get_owned_area(db: Session, area_id: str, owner: models.User) -> models.ParkingArea:
+    area = db.query(models.ParkingArea).filter(models.ParkingArea.id == area_id).first()
+    if not area:
+        raise HTTPException(status_code=404, detail="Listing not found.")
+    if area.owner_id != owner.id:
+        raise HTTPException(status_code=403, detail="You don't own this listing.")
+    return area
+
+
 @router.post("", response_model=schemas.ParkingAreaOut)
 def create_listing(
     payload: schemas.ParkingAreaCreate,
@@ -93,7 +125,7 @@ def create_listing(
         vehicle_type=payload.vehicle_type,
         opening_time=payload.opening_time,
         closing_time=payload.closing_time,
-        status="pending",
+        status="pending",  # always pending — only an admin can approve
     )
     db.add(area)
     db.flush()  # get area.id before creating slots
@@ -113,9 +145,9 @@ def create_listing(
 
 @router.get("", response_model=List[schemas.ParkingAreaOut])
 def search_listings(
-    lat: Optional[float] = None,
-    lng: Optional[float] = None,
-    max_price: Optional[float] = None,
+    lat: Optional[float] = Query(None, ge=-90, le=90),
+    lng: Optional[float] = Query(None, ge=-180, le=180),
+    max_price: Optional[float] = Query(None, ge=0, le=100000),
     vehicle_type: Optional[Literal["car", "bike"]] = None,
     db: Session = Depends(get_db),
 ):
@@ -153,8 +185,7 @@ def my_listings_summary(db: Session = Depends(get_db), owner: models.User = Depe
     """
     Powers the owner dashboard's stats strip and recent-activity feed:
     live occupancy across every listing, today's revenue, and the last
-    few bookings received — the things a real property owner actually
-    checks day to day, not just a list of listings.
+    few bookings received — only for THIS owner's listings.
     """
     areas = db.query(models.ParkingArea).filter(models.ParkingArea.owner_id == owner.id).all()
     area_ids = [a.id for a in areas]
@@ -208,9 +239,15 @@ def my_listings_summary(db: Session = Depends(get_db), owner: models.User = Depe
 
 
 @router.get("/{area_id}", response_model=schemas.ParkingAreaOut)
-def get_listing(area_id: str, lat: Optional[float] = None, lng: Optional[float] = None, db: Session = Depends(get_db)):
+def get_listing(
+    area_id: str,
+    lat: Optional[float] = Query(None, ge=-90, le=90),
+    lng: Optional[float] = Query(None, ge=-180, le=180),
+    db: Session = Depends(get_db),
+    user: Optional[models.User] = Depends(get_optional_user),
+):
     area = db.query(models.ParkingArea).filter(models.ParkingArea.id == area_id).first()
-    if not area:
+    if not area or not can_see_listing(area, user):
         raise HTTPException(status_code=404, detail="Listing not found.")
     return _to_out(area, db, lat, lng)
 
@@ -238,14 +275,13 @@ def update_listing(
     db: Session = Depends(get_db),
     owner: models.User = Depends(require_role("owner")),
 ):
-    area = db.query(models.ParkingArea).filter(models.ParkingArea.id == area_id).first()
-    if not area:
-        raise HTTPException(status_code=404, detail="Listing not found.")
-    if area.owner_id != owner.id:
-        raise HTTPException(status_code=403, detail="You don't own this listing.")
+    area = _get_owned_area(db, area_id, owner)
 
+    # Only the fields in ParkingAreaUpdate can change — never owner_id or
+    # status, so an owner can't approve their own listing.
     for field, value in payload.model_dump(exclude_unset=True).items():
-        setattr(area, field, value)
+        if value is not None:
+            setattr(area, field, value)
 
     db.commit()
     db.refresh(area)
@@ -259,40 +295,44 @@ async def upload_listing_photo(
     db: Session = Depends(get_db),
     owner: models.User = Depends(require_role("owner")),
 ):
-    area = db.query(models.ParkingArea).filter(models.ParkingArea.id == area_id).first()
-    if not area:
-        raise HTTPException(status_code=404, detail="Listing not found.")
-    if area.owner_id != owner.id:
-        raise HTTPException(status_code=403, detail="You don't own this listing.")
+    area = _get_owned_area(db, area_id, owner)
 
-    if file.content_type not in ALLOWED_IMAGE_TYPES:
-        raise HTTPException(status_code=400, detail="Only JPEG, PNG, or WEBP images are allowed.")
-
-    contents = await file.read()
+    contents = await file.read(MAX_IMAGE_SIZE_BYTES + 1)  # never read more than the limit
     if len(contents) > MAX_IMAGE_SIZE_BYTES:
         raise HTTPException(status_code=400, detail="Image must be under 5 MB.")
+    extension = _image_extension(contents)
+    if extension is None:
+        raise HTTPException(status_code=400, detail="Only JPEG, PNG, or WEBP images are allowed.")
 
     os.makedirs(UPLOAD_DIR, exist_ok=True)
-    extension = file.filename.rsplit(".", 1)[-1] if "." in file.filename else "jpg"
-    filename = f"{uuid.uuid4()}.{extension}"
-    filepath = os.path.join(UPLOAD_DIR, filename)
-
-    with open(filepath, "wb") as f:
+    filename = f"{uuid.uuid4()}.{extension}"  # our own name — the uploaded name is never used
+    with open(os.path.join(UPLOAD_DIR, filename), "wb") as f:
         f.write(contents)
 
+    old_url = area.image_url
     area.image_url = f"/uploads/{filename}"
     db.commit()
     db.refresh(area)
+    _remove_upload(old_url)
     return _to_out(area, db)
+
+
+def _remove_upload(image_url: Optional[str]) -> None:
+    """Delete a replaced/orphaned photo so old files don't pile up."""
+    if not image_url or not image_url.startswith("/uploads/"):
+        return
+    name = os.path.basename(image_url)
+    path = os.path.join(UPLOAD_DIR, name)
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        log.warning("Could not remove old upload %s", name)
 
 
 @router.delete("/{area_id}")
 def delete_listing(area_id: str, db: Session = Depends(get_db), owner: models.User = Depends(require_role("owner"))):
-    area = db.query(models.ParkingArea).filter(models.ParkingArea.id == area_id).first()
-    if not area:
-        raise HTTPException(status_code=404, detail="Listing not found.")
-    if area.owner_id != owner.id:
-        raise HTTPException(status_code=403, detail="You don't own this listing.")
+    area = _get_owned_area(db, area_id, owner)
 
     active_booking = (
         db.query(models.Booking)
@@ -309,6 +349,8 @@ def delete_listing(area_id: str, db: Session = Depends(get_db), owner: models.Us
             detail="Can't delete a listing with active bookings. Wait until they complete or cancel first.",
         )
 
+    image_url = area.image_url
     db.delete(area)  # cascades to parking_slots too, since models.py sets cascade="all, delete-orphan"
     db.commit()
+    _remove_upload(image_url)
     return {"detail": "Listing deleted."}
